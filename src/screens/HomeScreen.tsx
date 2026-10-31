@@ -1,4 +1,3 @@
-
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
   ActivityIndicator,
@@ -14,12 +13,13 @@ import {
   View,
 } from 'react-native';
 
-// ======================================================
-// CONFIGURATION
-// ======================================================
+import {
+  detectObjectsFromJpeg,
+  loadDrishtiModel,
+  type DrishtiDetection,
+} from '../services/AIModelService';
 
 const BASE_URL = 'http://192.168.4.1';
-
 const FRAME_URL = `${BASE_URL}/api/v1/frame`;
 const VIDEO_URL = `${BASE_URL}/api/v1/video`;
 
@@ -36,19 +36,6 @@ const COLORS = {
   red: '#DC2626',
   redLight: '#FEE2E2',
   orange: '#EA580C',
-};
-
-// ======================================================
-// TYPES
-// ======================================================
-
-type ApiResponse<T> = {
-  success?: boolean;
-  data?: T;
-  error?: {
-    code?: string;
-    message?: string;
-  } | null;
 };
 
 type DeviceStatus = {
@@ -94,16 +81,16 @@ type BatteryData = {
 
 type VideoState = 'not-tested' | 'working' | 'failed';
 
-// ======================================================
-// API HELPER
-// ======================================================
+async function readJson(response: Response, endpoint: string) {
+  let json: any = {};
 
-async function getJson<T>(endpoint: string): Promise<T> {
-  const response = await fetch(`${BASE_URL}${endpoint}`);
+  try {
+    json = await response.json();
+  } catch {
+    throw new Error(`${endpoint}: response was not valid JSON`);
+  }
 
-  const json = await response.json();
-
-  if (!response.ok) {
+  if (!response.ok || json?.success === false) {
     throw new Error(
       json?.error?.message ||
         json?.message ||
@@ -111,17 +98,15 @@ async function getJson<T>(endpoint: string): Promise<T> {
     );
   }
 
-  if (json?.success === false) {
-    throw new Error(
-      json?.error?.message || 'The device returned an API error.',
-    );
-  }
-
-  // Supports both wrapped and unwrapped firmware responses.
-  return (json?.data ?? json) as T;
+  return json?.data ?? json;
 }
 
-async function postJson<T>(
+async function getJson<T>(endpoint: string): Promise<T> {
+  const response = await fetch(`${BASE_URL}${endpoint}`);
+  return (await readJson(response, endpoint)) as T;
+}
+
+async function postJson<T = unknown>(
   endpoint: string,
   body: Record<string, unknown>,
 ): Promise<T> {
@@ -134,22 +119,22 @@ async function postJson<T>(
     body: JSON.stringify(body),
   });
 
-  const json = await response.json();
-
-  if (!response.ok || json?.success === false) {
-    throw new Error(
-      json?.error?.message ||
-        json?.message ||
-        `${endpoint} returned HTTP ${response.status}`,
-    );
-  }
-
-  return (json?.data ?? json) as T;
+  return (await readJson(response, endpoint)) as T;
 }
 
-// ======================================================
-// HOME SCREEN
-// ======================================================
+function getDetectionPosition(detection: DrishtiDetection) {
+  const centerX = (detection.box.left + detection.box.right) / 2;
+
+  if (centerX < 0.33) {
+    return 'LEFT';
+  }
+
+  if (centerX > 0.66) {
+    return 'RIGHT';
+  }
+
+  return 'CENTER';
+}
 
 export default function HomeScreen() {
   const [status, setStatus] = useState<DeviceStatus | null>(null);
@@ -159,6 +144,7 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
+  const [lastUpdated, setLastUpdated] = useState('--');
 
   const [sessionActive, setSessionActive] = useState(false);
 
@@ -170,18 +156,27 @@ export default function HomeScreen() {
   const [frameUpdated, setFrameUpdated] = useState('Not captured');
 
   const [videoBusy, setVideoBusy] = useState(false);
-  const [videoState, setVideoState] = useState<VideoState>('not-tested');
+  const [videoState, setVideoState] =
+    useState<VideoState>('not-tested');
+
   const [videoMessage, setVideoMessage] = useState(
     'MJPEG stream has not been tested.',
   );
 
-  const [lastUpdated, setLastUpdated] = useState('--');
+  // AI state
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiReady, setAiReady] = useState(false);
+  const [aiError, setAiError] = useState('');
+  const [detections, setDetections] = useState<DrishtiDetection[]>([]);
+  const [inferenceTime, setInferenceTime] = useState<number | null>(null);
 
   const refreshInProgress = useRef(false);
+  const frameRequestInProgress = useRef(false);
+  const aiBusy = useRef(false);
 
-  // ====================================================
-  // STATUS API
-  // ====================================================
+  // ==========================================
+  // DEVICE STATUS API
+  // ==========================================
 
   const fetchStatus = useCallback(async () => {
     const data = await getJson<DeviceStatus>('/api/v1/status');
@@ -196,20 +191,21 @@ export default function HomeScreen() {
     return data;
   }, []);
 
-  // ====================================================
+  // ==========================================
   // BATTERY API
-  // ====================================================
+  // ==========================================
 
   const fetchBattery = useCallback(async () => {
     const data = await getJson<BatteryData>('/api/v1/battery');
 
     setBattery(data);
+
     return data;
   }, []);
 
-  // ====================================================
+  // ==========================================
   // REFRESH DEVICE DATA
-  // ====================================================
+  // ==========================================
 
   const refreshAll = useCallback(async () => {
     if (refreshInProgress.current) {
@@ -229,10 +225,11 @@ export default function HomeScreen() {
 
       if (statusResult.status === 'rejected') {
         setConnected(false);
+
         setError(
           statusResult.reason instanceof Error
             ? statusResult.reason.message
-            : 'Cannot connect to Drishti. Check your Wi-Fi connection.',
+            : 'Cannot connect to Drishti. Check the ESP32 Wi-Fi.',
         );
       } else {
         setConnected(true);
@@ -240,74 +237,108 @@ export default function HomeScreen() {
         setLastUpdated(new Date().toLocaleTimeString());
       }
     } finally {
+      refreshInProgress.current = false;
       setRefreshing(false);
       setLoading(false);
-      refreshInProgress.current = false;
     }
   }, [fetchStatus, fetchBattery]);
 
-  // ====================================================
+  // ==========================================
   // AUTO REFRESH
-  // ====================================================
+  // ==========================================
 
   useEffect(() => {
     refreshAll();
 
-    const interval = setInterval(() => {
-      refreshAll();
-    }, 5000);
+    const timer = setInterval(refreshAll, 5000);
 
-    return () => clearInterval(interval);
+    return () => clearInterval(timer);
   }, [refreshAll]);
 
-  // ====================================================
-  // CAMERA FRAME
-  // ====================================================
+  // ==========================================
+  // CAMERA FRAME + AI INFERENCE
+  // ==========================================
 
   const captureFrame = useCallback(async () => {
+    if (frameRequestInProgress.current) {
+      return;
+    }
+
+    frameRequestInProgress.current = true;
     setCameraBusy(true);
 
     try {
-      // Check whether the firmware returns a JPEG.
-      const response = await fetch(
-        `${FRAME_URL}?check=${Date.now()}`,
-      );
+      const response = await fetch(`${FRAME_URL}?t=${Date.now()}`);
 
       if (!response.ok) {
-        let message = `Camera returned HTTP ${response.status}`;
-
-        try {
-          const json = await response.json();
-          message = json?.error?.message || message;
-        } catch {
-          // The response was not JSON.
-        }
-
-        throw new Error(message);
+        throw new Error(`Camera returned HTTP ${response.status}`);
       }
 
       const contentType = response.headers.get('content-type') || '';
 
       if (!contentType.toLowerCase().includes('image/jpeg')) {
         throw new Error(
-          `Expected image/jpeg but received ${contentType || 'unknown content type'}`,
+          `Expected image/jpeg but received ${
+            contentType || 'unknown content type'
+          }`,
         );
       }
 
-      // Image component loads the JPEG directly from the ESP32.
+      // Update camera preview.
       setFrameUri(`${FRAME_URL}?t=${Date.now()}`);
       setFrameUpdated(new Date().toLocaleTimeString());
-    } catch (err) {
-      Alert.alert(
-        'Camera Error',
-        err instanceof Error ? err.message : 'Unable to capture camera frame.',
-      );
+
+      // Run AI only after model is loaded.
+      if (aiReady && !aiBusy.current) {
+        aiBusy.current = true;
+
+        try {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+
+          const startedAt = Date.now();
+
+          const results = await detectObjectsFromJpeg(bytes);
+
+          setInferenceTime(Date.now() - startedAt);
+          setDetections(results);
+          setAiError('');
+
+          console.log(
+            '[DRISHTI AI] Detection results:',
+            JSON.stringify(results),
+          );
+        } catch (aiErr) {
+          const message =
+            aiErr instanceof Error
+              ? aiErr.message
+              : 'AI inference failed';
+
+          setAiError(message);
+
+          console.error('[DRISHTI AI] Inference failed:', aiErr);
+        } finally {
+          aiBusy.current = false;
+        }
+      }
+    } catch (captureErr) {
+      const message =
+        captureErr instanceof Error
+          ? captureErr.message
+          : 'Unable to capture camera frame.';
+
+      setError(message);
+
+      console.error('[DRISHTI CAMERA]', captureErr);
     } finally {
+      frameRequestInProgress.current = false;
       setCameraBusy(false);
     }
-  }, []);
+  }, [aiReady]);
 
-  // Refresh still frames during an active session.
+  // ==========================================
+  // ACTIVE SESSION FRAME MONITORING
+  // ==========================================
+
   useEffect(() => {
     if (!sessionActive) {
       return;
@@ -315,73 +346,76 @@ export default function HomeScreen() {
 
     captureFrame();
 
-    const interval = setInterval(() => {
-      captureFrame();
-    }, 1000);
+    const timer = setInterval(captureFrame, 1500);
 
-    return () => clearInterval(interval);
+    return () => clearInterval(timer);
   }, [sessionActive, captureFrame]);
 
-  // ====================================================
-  // MJPEG STREAM CHECK
-  // ====================================================
+  // ==========================================
+  // START AI SESSION
+  // ==========================================
 
-  const testVideoStream = async () => {
-    setVideoBusy(true);
-    setVideoState('not-tested');
-    setVideoMessage('Connecting to MJPEG stream...');
-
-    const controller = new AbortController();
-
-    const timeout = setTimeout(() => {
-      controller.abort();
-    }, 10000);
+  const startSession = async () => {
+    setAiLoading(true);
+    setAiError('');
 
     try {
-      const response = await fetch(VIDEO_URL, {
-        method: 'GET',
-        headers: {
-          Accept: 'multipart/x-mixed-replace',
-        },
-        signal: controller.signal,
-      });
+      await fetchStatus();
 
-      if (!response.ok) {
-        throw new Error(`Video API returned HTTP ${response.status}`);
-      }
+      await loadDrishtiModel();
 
-      const contentType = (
-        response.headers.get('content-type') || ''
-      ).toLowerCase();
+      setAiReady(true);
+      setDetections([]);
+      setInferenceTime(null);
 
-      if (!contentType.includes('multipart/x-mixed-replace')) {
-        throw new Error(
-          `Unexpected video content type: ${contentType || 'missing'}`,
-        );
-      }
+      setSessionActive(true);
 
-      setVideoState('working');
-      setVideoMessage(
-        'The ESP32 accepted the MJPEG connection and returned the expected content type. This checks the endpoint, not actual frame playback.',
+      Alert.alert(
+        'Drishti AI Started',
+        'The model loaded. Camera inference will begin now. This is a prototype and must not replace a white cane or guide dog.',
       );
-    } catch (err) {
-      setVideoState('failed');
+    } catch (startErr) {
+      const message =
+        startErr instanceof Error
+          ? startErr.message
+          : 'Unable to start Drishti AI.';
 
-      setVideoMessage(
-        err instanceof Error
-          ? err.message
-          : 'Unable to connect to the video stream.',
-      );
+      setAiError(message);
+
+      Alert.alert('AI Startup Failed', message);
     } finally {
-      clearTimeout(timeout);
-      controller.abort();
-      setVideoBusy(false);
+      setAiLoading(false);
     }
   };
 
-  // ====================================================
+  // ==========================================
+  // STOP SESSION
+  // ==========================================
+
+  const stopSession = async () => {
+    setSessionActive(false);
+
+    try {
+      if (connected && vibrationEnabled) {
+        await postJson('/api/v1/vibration/directional', {
+          left: false,
+          right: false,
+          duration_ms: 0,
+        });
+
+        await fetchStatus();
+      }
+    } catch (stopErr) {
+      console.warn(
+        '[DRISHTI] Could not send motor stop command:',
+        stopErr,
+      );
+    }
+  };
+
+  // ==========================================
   // MASTER VIBRATION CONTROL
-  // ====================================================
+  // ==========================================
 
   const changeVibration = async (enabled: boolean) => {
     setVibrationBusy(true);
@@ -391,38 +425,40 @@ export default function HomeScreen() {
 
       setVibrationEnabled(enabled);
 
-      // Refresh actual commanded state.
       await fetchStatus();
-
-      Alert.alert(
-        'Drishti',
-        `Master vibration ${enabled ? 'enabled' : 'disabled'}.`,
-      );
-    } catch (err) {
+    } catch (vibrationErr) {
       Alert.alert(
         'Vibration Error',
-        err instanceof Error ? err.message : 'Unable to change vibration.',
+        vibrationErr instanceof Error
+          ? vibrationErr.message
+          : 'Unable to change vibration.',
       );
     } finally {
       setVibrationBusy(false);
     }
   };
 
-  // ====================================================
+  // ==========================================
   // DIRECTIONAL VIBRATION
-  // ====================================================
+  // ==========================================
 
   const sendDirectionalVibration = async (
     left: boolean,
     right: boolean,
   ) => {
     if (!connected) {
-      Alert.alert('Device Offline', 'Connect to the Drishti Wi-Fi first.');
+      Alert.alert(
+        'Device Offline',
+        'Connect to Drishti Wi-Fi first.',
+      );
       return;
     }
 
     if (!status?.vibration?.available) {
-      Alert.alert('Unavailable', 'Vibration hardware is unavailable.');
+      Alert.alert(
+        'Unavailable',
+        'Vibration hardware is unavailable.',
+      );
       return;
     }
 
@@ -444,19 +480,21 @@ export default function HomeScreen() {
       });
 
       await fetchStatus();
-    } catch (err) {
+    } catch (vibrationErr) {
       Alert.alert(
         'Directional Vibration Error',
-        err instanceof Error ? err.message : 'Command failed.',
+        vibrationErr instanceof Error
+          ? vibrationErr.message
+          : 'Command failed.',
       );
     } finally {
       setVibrationBusy(false);
     }
   };
 
-  // ====================================================
-  // BOTH-MOTOR VIBRATION TEST
-  // ====================================================
+  // ==========================================
+  // BOTH MOTOR VIBRATION TEST
+  // ==========================================
 
   const runVibrationTest = async () => {
     if (!vibrationEnabled) {
@@ -474,70 +512,88 @@ export default function HomeScreen() {
         duration_ms: 500,
       });
 
+      await fetchStatus();
+
       Alert.alert(
         'Vibration Test',
-        'The firmware accepted the 500 ms vibration test.',
+        'Firmware accepted the 500 ms test.',
       );
-
-      await fetchStatus();
-    } catch (err) {
+    } catch (vibrationErr) {
       Alert.alert(
         'Vibration Error',
-        err instanceof Error ? err.message : 'Vibration test failed.',
+        vibrationErr instanceof Error
+          ? vibrationErr.message
+          : 'Vibration test failed.',
       );
     } finally {
       setVibrationBusy(false);
     }
   };
 
-  // ====================================================
-  // SESSION CONTROL
-  // ====================================================
+  // ==========================================
+  // MJPEG STREAM TEST
+  // ==========================================
 
-  const startSession = async () => {
+  const testVideoStream = async () => {
+    setVideoBusy(true);
+    setVideoState('not-tested');
+    setVideoMessage('Connecting to MJPEG stream...');
+
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, 10000);
+
     try {
-      await fetchStatus();
+      const response = await fetch(VIDEO_URL, {
+        headers: {
+          Accept: 'multipart/x-mixed-replace',
+        },
+        signal: controller.signal,
+      });
 
-      setSessionActive(true);
-
-      Alert.alert(
-        'Drishti Started',
-        'Device connected. Camera frame monitoring has started.',
-      );
-    } catch (err) {
-      Alert.alert(
-        'Connection Error',
-        err instanceof Error
-          ? `Connect to Drishti Wi-Fi first. ${err.message}`
-          : 'Connect to Drishti Wi-Fi first.',
-      );
-    }
-  };
-
-  const stopSession = async () => {
-    setSessionActive(false);
-
-    // Stop any currently commanded directional vibration.
-    if (connected && vibrationEnabled) {
-      try {
-        await postJson('/api/v1/vibration/directional', {
-          left: false,
-          right: false,
-          duration_ms: 0,
-        });
-
-        await fetchStatus();
-      } catch {
-        // Session still stops locally if the device is unreachable.
+      if (!response.ok) {
+        throw new Error(
+          `Video API returned HTTP ${response.status}`,
+        );
       }
-    }
 
-    Alert.alert('Drishti Stopped', 'Monitoring session stopped.');
+      const contentType = (
+        response.headers.get('content-type') || ''
+      ).toLowerCase();
+
+      if (!contentType.includes('multipart/x-mixed-replace')) {
+        throw new Error(
+          `Unexpected video content type: ${
+            contentType || 'missing'
+          }`,
+        );
+      }
+
+      setVideoState('working');
+
+      setVideoMessage(
+        'The endpoint returned the expected MJPEG content type. This does not prove that frames are playing.',
+      );
+    } catch (videoErr) {
+      setVideoState('failed');
+
+      setVideoMessage(
+        videoErr instanceof Error
+          ? videoErr.message
+          : 'Unable to connect to the video stream.',
+      );
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+      setVideoBusy(false);
+    }
   };
 
-  // ====================================================
+  // ==========================================
   // HELPER VALUES
-  // ====================================================
+  // ==========================================
 
   const batteryPercentage =
     typeof battery?.percentage === 'number'
@@ -556,26 +612,34 @@ export default function HomeScreen() {
         )}m`
       : '--';
 
-  const cameraReady = status?.camera?.ready === true;
-
-  // ====================================================
-  // LOADING
-  // ====================================================
+  // ==========================================
+  // LOADING SCREEN
+  // ==========================================
 
   if (loading) {
     return (
       <View style={styles.loadingContainer}>
         <StatusBar barStyle="dark-content" />
-        <ActivityIndicator size="large" color={COLORS.primary} />
-        <Text style={styles.loadingText}>Connecting to Drishti...</Text>
-        <Text style={styles.loadingSubtext}>{BASE_URL}</Text>
+
+        <ActivityIndicator
+          size="large"
+          color={COLORS.primary}
+        />
+
+        <Text style={styles.loadingText}>
+          Connecting to Drishti...
+        </Text>
+
+        <Text style={styles.mutedText}>
+          {BASE_URL}
+        </Text>
       </View>
     );
   }
 
-  // ====================================================
+  // ==========================================
   // MAIN UI
-  // ====================================================
+  // ==========================================
 
   return (
     <View style={styles.container}>
@@ -595,85 +659,60 @@ export default function HomeScreen() {
         <View style={styles.header}>
           <View>
             <Text style={styles.brand}>DRISHTI</Text>
-            <Text style={styles.subtitle}>
+            <Text style={styles.mutedText}>
               Smart Assistive Technology
             </Text>
           </View>
 
-          <View
-            style={[
-              styles.connectionBadge,
-              connected ? styles.onlineBadge : styles.offlineBadge,
-            ]}>
-            <View
-              style={[
-                styles.connectionDot,
-                {
-                  backgroundColor: connected
-                    ? COLORS.green
-                    : COLORS.red,
-                },
-              ]}
-            />
-            <Text
-              style={[
-                styles.connectionText,
-                {
-                  color: connected ? COLORS.green : COLORS.red,
-                },
-              ]}>
-              {connected ? 'Connected' : 'Offline'}
-            </Text>
-          </View>
+          <Badge
+            label={connected ? 'ONLINE' : 'OFFLINE'}
+            success={connected}
+          />
         </View>
 
         {!!error && (
-          <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{error}</Text>
-          </View>
+          <Text style={styles.errorBox}>
+            {error}
+          </Text>
         )}
 
         {/* DEVICE CONNECTION */}
 
         <Section title="Device Connection">
-          <View style={styles.connectionCard}>
-            <View style={styles.deviceIcon}>
-              <Text style={styles.deviceIconText}>⌁</Text>
-            </View>
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>
+              {status?.device || 'ESP32-S3 Smart Cap'}
+            </Text>
 
-            <View style={{flex: 1}}>
-              <Text style={styles.cardTitle}>ESP32-S3 Smart Cap</Text>
-              <Text style={styles.mutedText}>{BASE_URL}</Text>
-              <Text style={styles.smallText}>
-                Firmware: {status?.firmware_version || '--'}
-              </Text>
-            </View>
+            <Text style={styles.mutedText}>
+              {BASE_URL}
+            </Text>
 
-            <Badge label={connected ? 'ONLINE' : 'OFFLINE'} success={connected} />
-          </View>
+            <Text style={styles.smallText}>
+              Firmware: {status?.firmware_version || '--'}
+            </Text>
 
-          <View style={styles.twoColumns}>
-            <InfoCard
-              label="Wi-Fi Access Point"
-              value={status?.wifi?.ap_active ? 'Active' : 'Inactive'}
-            />
-            <InfoCard
-              label="Connected Clients"
-              value={String(status?.wifi?.connected_clients ?? '--')}
-            />
+            <Text style={styles.smallText}>
+              Wi-Fi AP: {status?.wifi?.ap_active ? 'Active' : 'Inactive'}
+              {' · '}
+              Clients: {status?.wifi?.connected_clients ?? '--'}
+            </Text>
           </View>
         </Section>
 
-        {/* BATTERY AND CAMERA STATUS */}
+        {/* DEVICE OVERVIEW */}
 
         <Section title="Device Overview">
-          <View style={styles.overviewCard}>
-            <View style={styles.overviewHeader}>
-              <Text style={styles.cardTitle}>Battery Level</Text>
+          <View style={styles.card}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>
+                Battery
+              </Text>
+
               <Text style={styles.batteryValue}>
-                {batteryPercentage !== null
-                  ? `${batteryPercentage}%`
-                  : '--'}
+                {batteryPercentage === null
+                  ? '--'
+                  : `${batteryPercentage}%`}
               </Text>
             </View>
 
@@ -682,43 +721,44 @@ export default function HomeScreen() {
                 style={[
                   styles.progressFill,
                   {
-                    width:
-                      batteryPercentage !== null
-                        ? `${batteryPercentage}%`
-                        : '0%',
+                    width: `${batteryPercentage ?? 0}%`,
                   },
                 ]}
               />
             </View>
 
-            <Text style={styles.smallText}>Voltage: {voltage}</Text>
             <Text style={styles.smallText}>
-              Charging: {battery?.charging == null
+              Voltage: {voltage}
+            </Text>
+
+            <Text style={styles.smallText}>
+              Charging:{' '}
+              {battery?.charging == null
                 ? 'Unknown'
                 : battery.charging
                 ? 'Yes'
                 : 'No'}
             </Text>
 
-            <Text style={styles.smallText}>
-              Charge state: {battery?.charge_state || '--'}
-            </Text>
-
             <View style={styles.divider} />
 
-            <View style={styles.overviewHeader}>
-              <Text style={styles.cardTitle}>Camera Status</Text>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>
+                Camera
+              </Text>
+
               <Badge
-                label={cameraReady ? 'READY' : 'NOT READY'}
-                success={cameraReady}
+                label={
+                  status?.camera?.ready
+                    ? 'READY'
+                    : 'NOT READY'
+                }
+                success={status?.camera?.ready === true}
               />
             </View>
 
             <Text style={styles.smallText}>
               Initialized: {status?.camera?.initialized ? 'Yes' : 'No'}
-            </Text>
-            <Text style={styles.smallText}>
-              Stream Active: {status?.camera?.stream_active ? 'Yes' : 'No'}
             </Text>
           </View>
         </Section>
@@ -726,33 +766,48 @@ export default function HomeScreen() {
         {/* SESSION CONTROL */}
 
         <Section title="Smart Cap Control">
-          <View style={styles.sessionCard}>
-            <View style={{flex: 1}}>
-              <Text style={styles.cardTitle}>Assistive Session</Text>
-              <Text style={styles.mutedText}>
-                {sessionActive
-                  ? 'Camera frame monitoring is active'
-                  : 'Start your device monitoring session'}
-              </Text>
+          <View style={styles.card}>
+            <View style={styles.rowBetween}>
+              <View style={{flex: 1}}>
+                <Text style={styles.cardTitle}>
+                  Assistive Session
+                </Text>
+
+                <Text style={styles.mutedText}>
+                  {sessionActive
+                    ? 'AI camera monitoring is active'
+                    : 'Start the AI monitoring session'}
+                </Text>
+              </View>
+
+              <Badge
+                label={sessionActive ? 'ACTIVE' : 'STOPPED'}
+                success={sessionActive}
+              />
             </View>
 
-            <Badge
-              label={sessionActive ? 'ACTIVE' : 'STOPPED'}
-              success={sessionActive}
-            />
-          </View>
+            <TouchableOpacity
+              style={[
+                styles.primaryButton,
+                sessionActive && styles.stopButton,
+                (!connected || aiLoading) && styles.disabledButton,
+              ]}
+              onPress={
+                sessionActive ? stopSession : startSession
+              }
+              disabled={!connected || aiLoading}>
 
-          <TouchableOpacity
-            style={[
-              styles.primaryButton,
-              sessionActive && styles.stopButton,
-            ]}
-            onPress={sessionActive ? stopSession : startSession}
-            disabled={!connected}>
-            <Text style={styles.primaryButtonText}>
-              {sessionActive ? 'Stop Session' : 'Start Smart Cap'}
-            </Text>
-          </TouchableOpacity>
+              {aiLoading ? (
+                <ActivityIndicator color={COLORS.white} />
+              ) : (
+                <Text style={styles.primaryButtonText}>
+                  {sessionActive
+                    ? 'Stop Session'
+                    : 'Start Smart Cap + AI'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
         </Section>
 
         {/* CAMERA PREVIEW */}
@@ -765,24 +820,20 @@ export default function HomeScreen() {
                 source={{uri: frameUri}}
                 style={styles.cameraImage}
                 resizeMode="contain"
-                onError={() => {
-                  setFrameUri(null);
-                }}
+                onError={() => setFrameUri(null)}
               />
             ) : (
-              <View style={styles.cameraPlaceholder}>
-                <Text style={styles.cameraIcon}>◉</Text>
-                <Text style={styles.cameraPlaceholderText}>
-                  No camera frame captured
-                </Text>
-              </View>
+              <Text style={styles.cameraPlaceholder}>
+                No camera frame captured
+              </Text>
             )}
 
             {cameraBusy && (
-              <View style={styles.cameraLoading}>
-                <ActivityIndicator color={COLORS.white} size="large" />
-                <Text style={styles.cameraLoadingText}>
-                  Capturing frame...
+              <View style={styles.cameraOverlay}>
+                <ActivityIndicator color={COLORS.white} />
+
+                <Text style={styles.cameraOverlayText}>
+                  Capturing / analysing...
                 </Text>
               </View>
             )}
@@ -797,20 +848,92 @@ export default function HomeScreen() {
             onPress={captureFrame}
             disabled={cameraBusy || !connected}>
             <Text style={styles.secondaryButtonText}>
-              {cameraBusy ? 'Capturing...' : 'Capture Camera Frame'}
+              {cameraBusy
+                ? 'Capturing...'
+                : 'Capture Camera Frame'}
             </Text>
           </TouchableOpacity>
+        </Section>
+
+        {/* AI OBJECT DETECTION */}
+
+        <Section title="Drishti AI Object Detection">
+          <View style={styles.card}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>
+                AI Engine
+              </Text>
+
+              <Badge
+                label={
+                  aiLoading
+                    ? 'LOADING'
+                    : aiReady
+                    ? 'READY'
+                    : 'NOT LOADED'
+                }
+                success={aiReady}
+              />
+            </View>
+
+            <Text style={styles.smallText}>
+              Inference time:{' '}
+              {inferenceTime === null
+                ? '--'
+                : `${inferenceTime} ms`}
+            </Text>
+
+            <Text style={styles.smallText}>
+              Objects detected: {detections.length}
+            </Text>
+
+            {!!aiError && (
+              <Text style={styles.errorText}>
+                {aiError}
+              </Text>
+            )}
+
+            {detections.map((item, index) => (
+              <View
+                key={`${item.classId}-${index}`}
+                style={styles.detectionRow}>
+
+                <Text style={styles.cardTitle}>
+                  Class ID: {item.classId}
+                </Text>
+
+                <Text style={styles.smallText}>
+                  Confidence: {(item.confidence * 100).toFixed(1)}%
+                </Text>
+
+                <Text style={styles.smallText}>
+                  Position: {getDetectionPosition(item)}
+                </Text>
+              </View>
+            ))}
+
+            {aiReady && detections.length === 0 && !aiError && (
+              <Text style={styles.mutedText}>
+                No objects detected above the confidence threshold in the latest analysed frame.
+              </Text>
+            )}
+
+            <Text style={styles.warningText}>
+              Prototype only: this generic model is not a validated
+              pothole or road-hazard detector. Do not rely on it for
+              safe navigation.
+            </Text>
+          </View>
         </Section>
 
         {/* MJPEG STREAM */}
 
         <Section title="MJPEG Stream Diagnostics">
-          <View style={styles.videoCard}>
-            <View style={styles.videoHeader}>
-              <View style={{flex: 1}}>
-                <Text style={styles.cardTitle}>ESP32 MJPEG Stream</Text>
-                <Text style={styles.mutedText}>GET /api/v1/video</Text>
-              </View>
+          <View style={styles.card}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.cardTitle}>
+                GET /api/v1/video
+              </Text>
 
               <Badge
                 label={
@@ -824,14 +947,15 @@ export default function HomeScreen() {
               />
             </View>
 
-            <View style={styles.divider} />
-
-            <Text style={styles.videoMessage}>{videoMessage}</Text>
+            <Text style={styles.smallText}>
+              {videoMessage}
+            </Text>
 
             <TouchableOpacity
               style={styles.secondaryButton}
               onPress={testVideoStream}
               disabled={videoBusy || !connected}>
+
               {videoBusy ? (
                 <ActivityIndicator color={COLORS.primary} />
               ) : (
@@ -843,137 +967,154 @@ export default function HomeScreen() {
           </View>
         </Section>
 
-        {/* MASTER VIBRATION */}
+        {/* HAPTIC FEEDBACK */}
 
         <Section title="Haptic Feedback">
-          <View style={styles.vibrationCard}>
-            <View style={{flex: 1}}>
-              <Text style={styles.cardTitle}>Master Vibration</Text>
-              <Text style={styles.mutedText}>
-                Enable or disable vibration motors
+          <View style={styles.card}>
+            <View style={styles.rowBetween}>
+              <View style={{flex: 1}}>
+                <Text style={styles.cardTitle}>
+                  Master Vibration
+                </Text>
+
+                <Text style={styles.mutedText}>
+                  Enable or disable the motors
+                </Text>
+              </View>
+
+              <Switch
+                value={vibrationEnabled}
+                onValueChange={changeVibration}
+                disabled={!connected || vibrationBusy}
+                trackColor={{
+                  false: '#CBD5E1',
+                  true: '#93C5FD',
+                }}
+                thumbColor={
+                  vibrationEnabled
+                    ? COLORS.primary
+                    : '#F8FAFC'
+                }
+              />
+            </View>
+
+            <View style={styles.motorRow}>
+              <Text style={styles.smallText}>
+                Left:{' '}
+                {!status?.vibration?.left_available
+                  ? 'Unavailable'
+                  : status.vibration.left_active
+                  ? 'Active'
+                  : 'Inactive'}
+              </Text>
+
+              <Text style={styles.smallText}>
+                Right:{' '}
+                {!status?.vibration?.right_available
+                  ? 'Unavailable'
+                  : status.vibration.right_active
+                  ? 'Active'
+                  : 'Inactive'}
               </Text>
             </View>
 
-            <Switch
-              value={vibrationEnabled}
-              onValueChange={changeVibration}
-              disabled={!connected || vibrationBusy}
-              trackColor={{
-                false: '#CBD5E1',
-                true: '#93C5FD',
-              }}
-              thumbColor={
-                vibrationEnabled ? COLORS.primary : '#F8FAFC'
+            <ActionButton
+              title="Vibrate Left (500 ms)"
+              disabled={
+                vibrationBusy || !connected || !vibrationEnabled
+              }
+              onPress={() =>
+                sendDirectionalVibration(true, false)
               }
             />
-          </View>
 
-          <View style={styles.overviewCard}>
-            <Text style={styles.cardTitle}>Directional Vibration</Text>
-            <Text style={styles.mutedText}>
-              Test each motor independently
-            </Text>
+            <ActionButton
+              title="Vibrate Right (500 ms)"
+              disabled={
+                vibrationBusy || !connected || !vibrationEnabled
+              }
+              onPress={() =>
+                sendDirectionalVibration(false, true)
+              }
+            />
 
-            <View style={styles.motorStatusRow}>
-              <MotorStatus
-                label="Left Motor"
-                active={status?.vibration?.left_active === true}
-                available={status?.vibration?.left_available === true}
-              />
-              <MotorStatus
-                label="Right Motor"
-                active={status?.vibration?.right_active === true}
-                available={status?.vibration?.right_available === true}
-              />
-            </View>
+            <ActionButton
+              title="Vibrate Both (500 ms)"
+              disabled={
+                vibrationBusy || !connected || !vibrationEnabled
+              }
+              onPress={() =>
+                sendDirectionalVibration(true, true)
+              }
+            />
 
-            <TouchableOpacity
-              style={styles.secondaryButton}
-              disabled={vibrationBusy || !connected || !vibrationEnabled}
-              onPress={() => sendDirectionalVibration(true, false)}>
-              <Text style={styles.secondaryButtonText}>
-                Vibrate Left Only (500 ms)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.secondaryButton}
-              disabled={vibrationBusy || !connected || !vibrationEnabled}
-              onPress={() => sendDirectionalVibration(false, true)}>
-              <Text style={styles.secondaryButtonText}>
-                Vibrate Right Only (500 ms)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.secondaryButton}
-              disabled={vibrationBusy || !connected || !vibrationEnabled}
-              onPress={() => sendDirectionalVibration(true, true)}>
-              <Text style={styles.secondaryButtonText}>
-                Vibrate Both (500 ms)
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.stopVibrationButton}
+            <ActionButton
+              title="Stop Both Motors"
               disabled={vibrationBusy || !connected}
-              onPress={() => sendDirectionalVibration(false, false)}>
-              <Text style={styles.stopVibrationText}>
-                Stop Both Motors
-              </Text>
-            </TouchableOpacity>
+              onPress={() =>
+                sendDirectionalVibration(false, false)
+              }
+              danger
+            />
 
-            <TouchableOpacity
-              style={styles.secondaryButton}
-              disabled={vibrationBusy || !connected || !vibrationEnabled}
-              onPress={runVibrationTest}>
-              <Text style={styles.secondaryButtonText}>
-                {vibrationBusy ? 'Please wait...' : 'Test Both Motors'}
-              </Text>
-            </TouchableOpacity>
+            <ActionButton
+              title="Test Both Motors"
+              disabled={
+                vibrationBusy || !connected || !vibrationEnabled
+              }
+              onPress={runVibrationTest}
+            />
           </View>
         </Section>
 
         {/* DEVICE INFORMATION */}
 
         <Section title="Device Information">
-          <View style={styles.infoCard}>
-            <InfoRow label="Device" value={status?.device || 'ESP32-S3'} />
+          <View style={styles.card}>
+            <InfoRow
+              label="Device"
+              value={status?.device || 'ESP32-S3'}
+            />
+
             <InfoRow
               label="Firmware"
               value={status?.firmware_version || '--'}
             />
-            <InfoRow label="Uptime" value={uptime} />
-            <InfoRow label="IP Address" value="192.168.4.1" />
+
             <InfoRow
-              label="Battery Available"
-              value={battery?.available ? 'Yes' : 'No / Unknown'}
+              label="Uptime"
+              value={uptime}
             />
+
             <InfoRow
-              label="Vibration Available"
-              value={status?.vibration?.available ? 'Yes' : 'No'}
+              label="IP Address"
+              value="192.168.4.1"
             />
-            <InfoRow label="Last Updated" value={lastUpdated} />
+
+            <InfoRow
+              label="Last Updated"
+              value={lastUpdated}
+            />
           </View>
         </Section>
 
         {/* FOOTER */}
 
         <View style={styles.footer}>
-          <Text style={styles.footerTitle}>DRISHTI</Text>
-          <Text style={styles.footerText}>
-            Assistive Technology for a More Accessible World
+          <Text style={styles.brand}>DRISHTI</Text>
+
+          <Text style={styles.mutedText}>
+            Assistive Technology for Accessibility
           </Text>
-          <Text style={styles.footerText}>Smart Cap Control Panel</Text>
         </View>
       </ScrollView>
     </View>
   );
 }
 
-// ======================================================
-// LOCAL UI COMPONENTS
-// ======================================================
+// ==========================================
+// REUSABLE UI COMPONENTS
+// ==========================================
 
 function Section({
   title,
@@ -984,7 +1125,10 @@ function Section({
 }) {
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
+      <Text style={styles.sectionTitle}>
+        {title}
+      </Text>
+
       {children}
     </View>
   );
@@ -1000,26 +1144,45 @@ function Badge({
   return (
     <View
       style={[
-        styles.statusPill,
-        success ? styles.successPill : styles.dangerPill,
+        styles.badge,
+        success ? styles.badgeSuccess : styles.badgeError,
       ]}>
-      <Text style={styles.statusPillText}>{label}</Text>
+      <Text style={styles.badgeText}>
+        {label}
+      </Text>
     </View>
   );
 }
 
-function InfoCard({
-  label,
-  value,
+function ActionButton({
+  title,
+  onPress,
+  disabled,
+  danger = false,
 }: {
-  label: string;
-  value: string;
+  title: string;
+  onPress: () => void;
+  disabled: boolean;
+  danger?: boolean;
 }) {
   return (
-    <View style={styles.infoSmallCard}>
-      <Text style={styles.mutedText}>{label}</Text>
-      <Text style={styles.infoSmallValue}>{value}</Text>
-    </View>
+    <TouchableOpacity
+      style={[
+        styles.secondaryButton,
+        danger && styles.dangerButton,
+        disabled && styles.disabledButton,
+      ]}
+      onPress={onPress}
+      disabled={disabled}>
+
+      <Text
+        style={[
+          styles.secondaryButtonText,
+          danger && styles.dangerText,
+        ]}>
+        {title}
+      </Text>
+    </TouchableOpacity>
   );
 }
 
@@ -1032,38 +1195,20 @@ function InfoRow({
 }) {
   return (
     <View style={styles.infoRow}>
-      <Text style={styles.mutedText}>{label}</Text>
-      <Text style={styles.infoRowValue}>{value}</Text>
-    </View>
-  );
-}
+      <Text style={styles.mutedText}>
+        {label}
+      </Text>
 
-function MotorStatus({
-  label,
-  active,
-  available,
-}: {
-  label: string;
-  active: boolean;
-  available: boolean;
-}) {
-  return (
-    <View style={styles.motorStatus}>
-      <Text style={styles.mutedText}>{label}</Text>
-      <Text
-        style={[
-          styles.motorStatusValue,
-          {color: active ? COLORS.green : COLORS.secondary},
-        ]}>
-        {!available ? 'Unavailable' : active ? 'Active' : 'Inactive'}
+      <Text style={styles.infoValue}>
+        {value}
       </Text>
     </View>
   );
 }
 
-// ======================================================
+// ==========================================
 // STYLES
-// ======================================================
+// ==========================================
 
 const styles = StyleSheet.create({
   container: {
@@ -1085,12 +1230,6 @@ const styles = StyleSheet.create({
     color: COLORS.text,
   },
 
-  loadingSubtext: {
-    marginTop: 6,
-    fontSize: 13,
-    color: COLORS.secondary,
-  },
-
   header: {
     paddingHorizontal: 20,
     paddingTop: 22,
@@ -1107,51 +1246,16 @@ const styles = StyleSheet.create({
     color: COLORS.primary,
   },
 
-  subtitle: {
+  mutedText: {
     fontSize: 12,
     color: COLORS.secondary,
-    marginTop: 3,
+    marginTop: 4,
   },
 
-  connectionBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 11,
-    paddingVertical: 8,
-    borderRadius: 20,
-  },
-
-  onlineBadge: {
-    backgroundColor: COLORS.greenLight,
-  },
-
-  offlineBadge: {
-    backgroundColor: COLORS.redLight,
-  },
-
-  connectionDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 5,
-    marginRight: 6,
-  },
-
-  connectionText: {
+  smallText: {
     fontSize: 12,
-    fontWeight: '700',
-  },
-
-  errorBox: {
-    marginHorizontal: 20,
-    marginBottom: 12,
-    backgroundColor: COLORS.redLight,
-    padding: 13,
-    borderRadius: 10,
-  },
-
-  errorText: {
-    color: COLORS.red,
-    fontSize: 13,
+    color: COLORS.secondary,
+    marginTop: 7,
   },
 
   section: {
@@ -1166,29 +1270,12 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
 
-  connectionCard: {
+  card: {
     backgroundColor: COLORS.white,
-    padding: 15,
+    padding: 16,
     borderRadius: 15,
-    flexDirection: 'row',
-    alignItems: 'center',
     borderWidth: 1,
     borderColor: COLORS.border,
-  },
-
-  deviceIcon: {
-    width: 48,
-    height: 48,
-    borderRadius: 14,
-    backgroundColor: COLORS.primaryLight,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 12,
-  },
-
-  deviceIconText: {
-    fontSize: 30,
-    color: COLORS.primary,
   },
 
   cardTitle: {
@@ -1197,73 +1284,53 @@ const styles = StyleSheet.create({
     color: COLORS.text,
   },
 
-  mutedText: {
-    fontSize: 12,
-    color: COLORS.secondary,
-    marginTop: 4,
+  rowBetween: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
 
-  smallText: {
-    fontSize: 12,
-    color: COLORS.secondary,
-    marginTop: 7,
-  },
-
-  statusPill: {
-    paddingHorizontal: 9,
+  badge: {
+    paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 20,
     alignSelf: 'flex-start',
   },
 
-  successPill: {
+  badgeSuccess: {
     backgroundColor: COLORS.greenLight,
   },
 
-  dangerPill: {
+  badgeError: {
     backgroundColor: COLORS.redLight,
   },
 
-  statusPillText: {
+  badgeText: {
     fontSize: 10,
     fontWeight: '800',
     color: COLORS.text,
   },
 
-  twoColumns: {
-    flexDirection: 'row',
+  errorBox: {
+    marginHorizontal: 20,
+    marginBottom: 12,
+    backgroundColor: COLORS.redLight,
+    padding: 12,
+    borderRadius: 10,
+    color: COLORS.red,
+  },
+
+  errorText: {
+    color: COLORS.red,
     marginTop: 10,
-    gap: 10,
+    fontSize: 12,
   },
 
-  infoSmallCard: {
-    flex: 1,
-    backgroundColor: COLORS.white,
-    borderRadius: 13,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-
-  infoSmallValue: {
-    fontSize: 17,
-    fontWeight: '800',
-    color: COLORS.text,
-    marginTop: 8,
-  },
-
-  overviewCard: {
-    backgroundColor: COLORS.white,
-    padding: 17,
-    borderRadius: 15,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-
-  overviewHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
+  warningText: {
+    color: COLORS.orange,
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: 14,
   },
 
   batteryValue: {
@@ -1293,32 +1360,26 @@ const styles = StyleSheet.create({
     marginVertical: 16,
   },
 
-  sessionCard: {
-    backgroundColor: COLORS.white,
-    borderRadius: 14,
-    padding: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginBottom: 12,
-  },
-
   primaryButton: {
     backgroundColor: COLORS.primary,
     padding: 16,
     borderRadius: 13,
     alignItems: 'center',
-  },
-
-  stopButton: {
-    backgroundColor: COLORS.red,
+    marginTop: 16,
   },
 
   primaryButtonText: {
     color: COLORS.white,
     fontWeight: '800',
     fontSize: 15,
+  },
+
+  stopButton: {
+    backgroundColor: COLORS.red,
+  },
+
+  disabledButton: {
+    opacity: 0.45,
   },
 
   cameraCard: {
@@ -1336,50 +1397,20 @@ const styles = StyleSheet.create({
   },
 
   cameraPlaceholder: {
-    alignItems: 'center',
-  },
-
-  cameraIcon: {
-    fontSize: 45,
-    color: '#94A3B8',
-  },
-
-  cameraPlaceholderText: {
     color: '#CBD5E1',
     fontSize: 13,
-    marginTop: 10,
   },
 
-  cameraLoading: {
-    ...StyleSheet.absoluteFill,
-    backgroundColor: 'rgba(0,0,0,0.65)',
+  cameraOverlay: {
+   ...StyleSheet.absoluteFill,
+    backgroundColor: 'rgba(0,0,0,0.55)',
     justifyContent: 'center',
     alignItems: 'center',
   },
 
-  cameraLoadingText: {
+  cameraOverlayText: {
     color: COLORS.white,
-    marginTop: 10,
-  },
-
-  videoCard: {
-    backgroundColor: COLORS.white,
-    borderRadius: 14,
-    padding: 15,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-
-  videoHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-
-  videoMessage: {
-    color: COLORS.secondary,
-    fontSize: 13,
-    lineHeight: 19,
+    marginTop: 8,
   },
 
   secondaryButton: {
@@ -1393,71 +1424,39 @@ const styles = StyleSheet.create({
   secondaryButtonText: {
     color: COLORS.primary,
     fontWeight: '800',
-    fontSize: 14,
-  },
-
-  vibrationCard: {
-    backgroundColor: COLORS.white,
-    borderRadius: 14,
-    padding: 15,
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginBottom: 12,
-  },
-
-  motorStatusRow: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 15,
-  },
-
-  motorStatus: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-    padding: 12,
-    borderRadius: 10,
-  },
-
-  motorStatusValue: {
     fontSize: 13,
-    fontWeight: '800',
-    marginTop: 6,
   },
 
-  stopVibrationButton: {
-    marginTop: 11,
-    padding: 14,
-    borderRadius: 12,
+  dangerButton: {
     backgroundColor: COLORS.redLight,
-    alignItems: 'center',
   },
 
-  stopVibrationText: {
+  dangerText: {
     color: COLORS.red,
-    fontWeight: '800',
-    fontSize: 14,
   },
 
-  infoCard: {
-    backgroundColor: COLORS.white,
-    borderRadius: 14,
-    paddingHorizontal: 15,
-    borderWidth: 1,
-    borderColor: COLORS.border,
+  detectionRow: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+  },
+
+  motorRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
   },
 
   infoRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 14,
+    paddingVertical: 13,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
 
-  infoRowValue: {
+  infoValue: {
     fontSize: 12,
     fontWeight: '700',
     color: COLORS.text,
@@ -1469,19 +1468,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 25,
     paddingHorizontal: 20,
-  },
-
-  footerTitle: {
-    color: COLORS.primary,
-    fontSize: 19,
-    fontWeight: '900',
-    letterSpacing: 2,
-  },
-
-  footerText: {
-    color: COLORS.secondary,
-    fontSize: 11,
-    marginTop: 5,
-    textAlign: 'center',
   },
 });
